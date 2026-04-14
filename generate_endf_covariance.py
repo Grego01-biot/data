@@ -6,6 +6,14 @@ generate_endf_with_cov.py
 Download and process an ENDF/B library for use in OpenMC, then attach
 multigroup MF=33 cross-section covariances (1500-group uniform-lethargy grid)
 produced by NJOY/ERRORR to every incident-neutron HDF5 file.
+
+This script is based on the existing generate_endf.py in openmc-dev/data,
+extended with covariance processing.
+
+Requires
+--------
+- openmc (with the MF=33 covariance PR merged)
+- NJOY executable (set via --njoy or $NJOY environment variable)
 """
 
 from __future__ import annotations
@@ -32,11 +40,11 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s [%(name)s] %(messa
 log = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Fixed 1500-group uniform-lethargy energy grid
+# Default covariance settings
 # ---------------------------------------------------------------------------
-ENERGY_GRID_EV = np.logspace(np.log10(1e-5), np.log10(150e6), 1501)
-COV_TEMPERATURE = 294.0
-EIG_TOL = 1e-10
+DEFAULT_COV_GRID_EV = np.logspace(np.log10(1e-5), np.log10(20e6), 1501)
+DEFAULT_COV_TEMPERATURE = 293.6
+DEFAULT_EIG_TOL = 1e-10
 
 
 # ---------------------------------------------------------------------------
@@ -46,36 +54,6 @@ EIG_TOL = 1e-10
 class CustomFormatter(argparse.ArgumentDefaultsHelpFormatter,
                       argparse.RawDescriptionHelpFormatter):
     pass
-
-
-def _import_module_as(mod_qualname: str, path: Path):
-    spec = importlib.util.spec_from_file_location(mod_qualname, str(path))
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Could not load spec for {mod_qualname} from {path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[mod_qualname] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def _load_neutron_xs_covariances(cov_mod_dir: Path):
-    try:
-        from openmc.data.xs_covariance_njoy import NeutronXSCovariances
-        return NeutronXSCovariances
-    except Exception:
-        cov_mod_dir = cov_mod_dir.resolve()
-        _import_module_as("openmc.data.mf33_njoy", cov_mod_dir / "mf33_njoy.py")
-        mod = _import_module_as("openmc.data.xs_covariance_njoy",
-                                cov_mod_dir / "xs_covariance_njoy.py")
-        return mod.NeutronXSCovariances
-
-
-def _attach_mf33(h5_path: Path, cov) -> None:
-    with h5py.File(h5_path, "r+") as f:
-        nuc_name = next(iter(f.keys()))
-        cov_root = f[nuc_name].require_group("covariance")
-        cov.write_mf33_group(cov_root, store_raw_covariance=True)
-
 
 def _build_release_details(endf_files_dir, neutron_dir, thermal_dir):
     return {
@@ -333,7 +311,11 @@ def _build_release_details(endf_files_dir, neutron_dir, thermal_dir):
         },
     }
 
-def process_neutron_merged(
+# ---------------------------------------------------------------------------
+# Neutron processing with covariance attachment
+# ---------------------------------------------------------------------------
+ 
+def process_neutron_with_covariance(
     endf_file,
     neutron_dest,
     libver,
@@ -343,67 +325,91 @@ def process_neutron_merged(
     cov_energy_grid_ev=None,
     cov_temperature=293.6,
     eig_tol=1e-10,
-    cov_mod_dir=None,
 ):
+    """Process a single ENDF neutron file: standard NJOY chain + optional
+    MF=33 covariance attachment.
+ 
+    If the covariance step fails (e.g. the evaluation lacks MF=33 data),
+    the HDF5 file is still written with standard cross-section data.
+    """
+    from openmc.data.xs_covariance_njoy import NeutronXSCovariances
+ 
+    # Step 1: standard NJOY processing (always runs)
     data = openmc.data.IncidentNeutron.from_njoy(
         endf_file,
         temperatures=temperatures,
         njoy_exec=njoy_exec,
     )
-
+ 
+    # Step 2: covariance attachment (best-effort)
     if cov_energy_grid_ev is not None:
-        NeutronXSCovariances = _load_neutron_xs_covariances(cov_mod_dir)
-        cov = NeutronXSCovariances.from_endf(
-            endf_file,
-            cov_energy_grid_ev,
-            njoy_exec=njoy_exec,
-            temperature=cov_temperature,
-            name=data.name,
-            eig_tol=eig_tol,
-        )
-        data.mg_covariance = cov
-
+        try:
+            cov = NeutronXSCovariances.from_endf(
+                endf_file,
+                cov_energy_grid_ev,
+                njoy_exec=njoy_exec,
+                temperature=cov_temperature,
+                name=data.name,
+                eig_tol=eig_tol,
+            )
+            data.mg_covariance = cov
+            log.info("MF=33 covariance attached for %s", data.name)
+        except Exception:
+            log.warning(
+                "MF=33 covariance skipped for %s (no MF=33 data or "
+                "ERRORR failure):\n%s",
+                data.name, traceback.format_exc(),
+            )
+ 
+    # Step 3: write HDF5 (always succeeds)
     h5_path = neutron_dest / f"{data.name}.h5"
     data.export_to_hdf5(h5_path, 'w', libver=libver)
     return h5_path
-
+ 
+ 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-
+ 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=CustomFormatter)
-    parser.add_argument('-d', '--destination', type=Path,
-                        help='Directory to create new library in')
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=CustomFormatter,
+    )
+    parser.add_argument(
+        '-d', '--destination', type=Path,
+        help='Directory to create new library in',
+    )
     parser.add_argument('--download', action='store_true',
                         help='Download files from NNDC')
     parser.add_argument('--no-download', dest='download', action='store_false')
     parser.add_argument('--extract', action='store_true',
                         help='Extract compressed files')
     parser.add_argument('--no-extract', dest='extract', action='store_false')
-    parser.add_argument('--libver', choices=['earliest', 'latest'], default='earliest',
-                        help="HDF5 versioning")
-    parser.add_argument('-r', '--release', choices=['vii.1', 'viii.0', 'viii.1'],
-                        default='viii.1', help="ENDF/B release version")
-    parser.add_argument('-p', '--particles', choices=['neutron', 'thermal', 'photon', 'wmp'],
+    parser.add_argument('--libver', choices=['earliest', 'latest'],
+                        default='earliest', help='HDF5 versioning')
+    parser.add_argument('-r', '--release',
+                        choices=['vii.1', 'viii.0', 'viii.1'],
+                        default='viii.1', help='ENDF/B release version')
+    parser.add_argument('-p', '--particles',
+                        choices=['neutron', 'thermal', 'photon', 'wmp'],
                         nargs='+', default=['neutron', 'thermal', 'photon'])
     parser.add_argument('--cleanup', action='store_true')
     parser.add_argument('--no-cleanup', dest='cleanup', action='store_false')
     parser.add_argument('--temperatures', type=float, nargs='+',
                         default=[250.0, 293.6, 600.0, 900.0, 1200.0, 2500.0])
     parser.add_argument('--njoy', type=str, default=None,
-                        help="NJOY executable (falls back to $NJOY)")
+                        help='NJOY executable (falls back to $NJOY)')
+    parser.add_argument('--no-covariance', action='store_true',
+                        help='Skip MF=33 covariance processing')
     parser.set_defaults(download=True, extract=True, cleanup=False)
     args = parser.parse_args()
-
-    cov_mod_dir = Path(__file__).resolve().parent
-
+ 
     def sort_key(path):
         if path.name.startswith('c_'):
             return (1000, path)
         else:
             return openmc.data.zam(path.stem)
-
+ 
     library_name = 'endfb'
     cwd = Path.cwd()
     endf_files_dir = cwd / '-'.join([library_name, args.release, 'endf'])
@@ -412,9 +418,11 @@ def main():
     download_path = cwd / '-'.join([library_name, args.release, 'download'])
     if args.destination is None:
         args.destination = Path('-'.join([library_name, args.release, 'hdf5']))
-
-    release_details = _build_release_details(endf_files_dir, neutron_dir, thermal_dir)
-
+ 
+    release_details = _build_release_details(
+        endf_files_dir, neutron_dir, thermal_dir,
+    )
+ 
     # ---- Download ----
     if args.download:
         for particle in args.particles:
@@ -425,13 +433,18 @@ def main():
                 if 'checksums' in details:
                     kw['checksum'] = details['checksums'][i]
                 download(url, output_path=download_path / particle, **kw)
-
+ 
     # ---- Extract ----
     if args.extract:
-        extract_kwargs = {'filter': 'data'} if sys.version_info >= (3, 12) else {}
+        extract_kwargs = (
+            {'filter': 'data'} if sys.version_info >= (3, 12) else {}
+        )
         for particle in args.particles:
             ft = release_details[args.release][particle]['file_type']
-            extraction_dir = (args.destination / particle) if ft == 'wmp' else (endf_files_dir / particle)
+            extraction_dir = (
+                (args.destination / particle) if ft == 'wmp'
+                else (endf_files_dir / particle)
+            )
             extraction_dir.mkdir(parents=True, exist_ok=True)
             for f in release_details[args.release][particle]['compressed_files']:
                 fname = Path(f).name
@@ -442,158 +455,125 @@ def main():
                             filename = Path(member).name
                             if not filename:
                                 continue
-                            with zipf.open(member) as src, open(extraction_dir / filename, "wb") as dst:
+                            with (zipf.open(member) as src,
+                                  open(extraction_dir / filename, 'wb') as dst):
                                 copyfileobj(src, dst)
                 elif fname.endswith('.tar.gz'):
                     print(f'Extracting {fname}...')
-                    with tarfile.open(download_path / particle / fname, 'r') as tgz:
+                    with tarfile.open(
+                        download_path / particle / fname, 'r',
+                    ) as tgz:
                         for member in tgz.getmembers():
                             if member.isreg():
                                 member.name = Path(member.name).name
-                                tgz.extract(member, path=extraction_dir, **extract_kwargs)
+                                tgz.extract(
+                                    member, path=extraction_dir,
+                                    **extract_kwargs,
+                                )
                 else:
-                    copy(download_path / particle / fname, extraction_dir / fname)
+                    copy(
+                        download_path / particle / fname,
+                        extraction_dir / fname,
+                    )
         if args.cleanup and download_path.exists():
             rmtree(download_path)
-
+ 
     # ---- Output dirs ----
     for particle in args.particles:
         (args.destination / particle).mkdir(parents=True, exist_ok=True)
-
+ 
     library = openmc.data.DataLibrary()
-
+ 
     # ================================================================
-    # NEUTRON: standard processing (parallel) then covariances
+    # NEUTRON
     # ================================================================
     if 'neutron' in args.particles:
         details = release_details[args.release]['neutron']
         neutron_dest = args.destination / 'neutron'
-        endf_files = [f for f in details['endf_files']
-                      if f.name != 'n-000_n_001.endf']
-        
-        NeutronXSCovariances = _load_neutron_xs_covariances(cov_mod_dir)
-
+        endf_files = [
+            f for f in details['endf_files']
+            if f.name != 'n-000_n_001.endf'
+        ]
+ 
+        cov_grid = None if args.no_covariance else DEFAULT_COV_GRID_EV
+ 
+        print(f"\nProcessing {len(endf_files)} neutron evaluations"
+              f"{' (with MF=33 covariances)' if cov_grid is not None else ''}...")
+ 
         with Pool() as pool:
             results = []
             for fn in endf_files:
                 r = pool.apply_async(
-                    process_neutron_merged,
+                    process_neutron_with_covariance,
                     (fn, neutron_dest, args.libver, args.temperatures),
                     dict(
                         njoy_exec=args.njoy,
-                        cov_energy_grid_ev=ENERGY_GRID_EV,
-                        cov_temperature=COV_TEMPERATURE,
-                        eig_tol=EIG_TOL,
-                        cov_mod_dir=cov_mod_dir,
+                        cov_energy_grid_ev=cov_grid,
+                        cov_temperature=DEFAULT_COV_TEMPERATURE,
+                        eig_tol=DEFAULT_EIG_TOL,
                     ),
                 )
                 results.append((fn, r))
-
+ 
             for fn, r in results:
                 try:
                     r.get()
                 except Exception:
-                    log.error("Processing FAILED for %s:\n%s",
-                            fn.name, traceback.format_exc())
-
+                    log.error(
+                        "Processing FAILED for %s:\n%s",
+                        fn.name, traceback.format_exc(),
+                    )
+ 
         for p in sorted(neutron_dest.glob('*.h5'), key=sort_key):
             library.register_file(p)
-
-        '''# Step 1 — standard NJOY processing in parallel
-        print(f"\nProcessing {len(endf_files)} neutron evaluations...")
-        with Pool() as pool:
-            results = []
-            for fn in endf_files:
-                r = pool.apply_async(process_neutron,
-                                     (fn, neutron_dest, args.libver, args.temperatures))
-                results.append((fn, r))
-            for fn, r in results:
-                try:
-                    r.get()
-                except Exception:
-                    log.error("Processing FAILED for %s:\n%s",
-                              fn.name, traceback.format_exc())
-
-        # Step 2 — attach MF=33 covariances (sequential, each calls ERRORR)
-        print(f"\nAttaching MF=33 covariances (1500-group lethargy grid)...")
-        NeutronXSCovariances = _load_neutron_xs_covariances(cov_mod_dir)
-        ok, fail = 0, 0
-
-        for endf_file in endf_files:
-            try:
-                data_tmp = openmc.data.IncidentNeutron.from_endf(str(endf_file))
-                nuc_name = data_tmp.name
-            except Exception:
-                nuc_name = endf_file.stem
-
-            h5_path = neutron_dest / f"{nuc_name}.h5"
-            if not h5_path.exists():
-                log.warning("HDF5 not found for %s, skipping covariance", endf_file.name)
-                fail += 1
-                continue
-
-            try:
-                cov = NeutronXSCovariances.from_endf(
-                    endf_file, ENERGY_GRID_EV,
-                    njoy_exec=args.njoy,
-                    temperature=COV_TEMPERATURE,
-                    name=nuc_name,
-                    eig_tol=EIG_TOL,
-                )
-                _attach_mf33(h5_path, cov)
-                ok += 1
-                log.info("MF=33 attached -> %s", h5_path.name)
-            except Exception:
-                fail += 1
-                log.warning("MF=33 FAILED for %s (HDF5 still valid):\n%s",
-                            endf_file.name, traceback.format_exc())
-
-        print(f"Covariance summary: {ok} succeeded, {fail} failed / {len(endf_files)} total")
-
-        for p in sorted(neutron_dest.glob('*.h5'), key=sort_key):
-            library.register_file(p)'''
-
+ 
     # ================================================================
-    # THERMAL (unchanged)
+    # THERMAL
     # ================================================================
     if 'thermal' in args.particles:
         details = release_details[args.release]['thermal']
         with Pool() as pool:
             results = []
             for path_n, path_t in details['sab_files']:
-                r = pool.apply_async(process_thermal,
-                                     (neutron_dir / path_n, thermal_dir / path_t,
-                                      args.destination / 'thermal', args.libver))
+                r = pool.apply_async(
+                    process_thermal,
+                    (neutron_dir / path_n, thermal_dir / path_t,
+                     args.destination / 'thermal', args.libver),
+                )
                 results.append(r)
             for r in results:
                 r.wait()
-        for p in sorted((args.destination / 'thermal').glob('*.h5'), key=sort_key):
+        for p in sorted(
+            (args.destination / 'thermal').glob('*.h5'), key=sort_key,
+        ):
             library.register_file(p)
-
+ 
     # ================================================================
-    # PHOTON (unchanged)
+    # PHOTON
     # ================================================================
     if 'photon' in args.particles:
         details = release_details[args.release]['photon']
-        for photo_path, atom_path in zip(sorted(details['photo_files']),
-                                         sorted(details['atom_files'])):
+        for photo_path, atom_path in zip(
+            sorted(details['photo_files']),
+            sorted(details['atom_files']),
+        ):
             print('Converting:', photo_path.name, atom_path.name)
             data = openmc.data.IncidentPhoton.from_endf(photo_path, atom_path)
             h5_file = args.destination / 'photon' / f'{data.name}.h5'
             data.export_to_hdf5(h5_file, 'w', libver=args.libver)
             library.register_file(h5_file)
-
+ 
     # ================================================================
-    # WMP (unchanged)
+    # WMP
     # ================================================================
     if 'wmp' in args.particles:
         for h5_file in sorted((args.destination / 'wmp').rglob('*.h5')):
             library.register_file(h5_file)
-
+ 
     # ---- cross_sections.xml ----
     library.export_to_xml(args.destination / 'cross_sections.xml')
     print(f"\nLibrary written to: {args.destination}")
-
-
+ 
+ 
 if __name__ == '__main__':
     main()
